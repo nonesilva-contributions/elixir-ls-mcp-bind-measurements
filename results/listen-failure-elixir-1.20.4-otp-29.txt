@@ -1,0 +1,26 @@
+environment
+  image: elixir:1.20.4-otp-29
+  Elixir 1.20.4, OTP 29.1.2, erts 17.1.1
+  user 1000, not root: a listen on a port below 1024 fails
+
+## 1. master, mcpPort 80
+  -> listen on port 80 as this user     -> {:error, :eacces}
+  -> language server                    -> down: {:shutdown, {:failed_to_start_child, ElixirLS.LanguageServer.MCP.TCPServer, :eacces}}
+
+## 2. master, mcpHost 192.0.2.1
+  -> listen on 192.0.2.1                -> {:error, :eaddrnotavail}
+  -> language server                    -> alive
+
+## 3. patch, mcpPort 80
+  -> listen on port 80 as this user     -> {:error, :eacces}
+  -> language server                    -> alive
+
+## 4. patch, mcpHost 192.0.2.1
+  -> listen on 192.0.2.1                -> {:error, :eaddrnotavail}
+  -> language server                    -> alive
+
+## 5. patch, mix test test/mcp/
+  -> tests                              -> Result: 27 passed
+
+summary: case 1 match, case 2 match, case 3 match, case 4 match, case 5 match
+done

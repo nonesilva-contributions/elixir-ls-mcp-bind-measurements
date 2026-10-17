@@ -1,0 +1,40 @@
+environment
+  image: erlang:28
+  OTP 28.5.0.8, erts 16.4.0.7
+  non-loopback IPv4: <bridge-ip>
+
+## 1. master at 68df44b6: the listen options of tcp_server.ex:135, no {ip, _}
+  -> bound address                      -> {0,0,0,0}
+  -> connect from <bridge-ip>           -> ok
+  -> connect ::1                        -> {error,econnrefused}
+
+## 2. first version of the pull request: the same options plus {ip, {127,0,0,1}}
+  -> bound address                      -> {127,0,0,1}
+  -> connect from <bridge-ip>           -> {error,econnrefused}
+  -> connect 127.0.0.1                  -> ok
+
+## 3. bridge script: gen_tcp:connect by the name "localhost", no family option
+  -> inet_db:res_option(inet6)          -> false
+  -> inet:getaddr("localhost", inet)    -> {ok,{127,0,0,1}}
+  -> connect by the name "localhost"    -> ok
+
+## 4. the patch: mcpHost "localhost", the default
+  -> resolve("localhost")               -> {ok,{127,0,0,1}}
+  -> bound address                      -> {127,0,0,1}
+  -> connect from <bridge-ip>           -> {error,econnrefused}
+  -> connect 127.0.0.1                  -> ok
+  -> connect by the name "localhost"    -> ok
+
+## 5. the patch: mcpHost "0.0.0.0", a value that a user must choose
+  -> resolve("0.0.0.0")                 -> {ok,{0,0,0,0}}
+  -> bound address                      -> {0,0,0,0}
+  -> connect from <bridge-ip>           -> ok
+
+## 6. the patch: mcpHost "::1", an 8-tuple, so the listen options get inet6
+  -> resolve("::1")                     -> {ok,{0,0,0,0,0,0,0,1}}
+  -> bound address                      -> {0,0,0,0,0,0,0,1}
+  -> connect ::1                        -> ok
+  -> connect 127.0.0.1                  -> {error,econnrefused}
+
+summary: case 1 match, case 2 match, case 3 match, case 4 match, case 5 match, case 6 match
+done

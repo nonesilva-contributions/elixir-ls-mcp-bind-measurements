@@ -1,0 +1,316 @@
+From 33cbe3d23ce0900dec2229a5b9cf9520a17c2a66 Mon Sep 17 00:00:00 2001
+From: Guilherme Silva <239806034+NoneSilva@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 14:31:49 +0000
+Subject: [PATCH] Bind the MCP server to loopback
+
+The MCP server listened on 0.0.0.0, so the network could reach it, and
+it has no authentication. The new setting elixirLS.mcpHost chooses the
+host it listens on. The default is localhost, so it stays on loopback.
+The bridge script takes the host as an optional second argument.
+
+A failure to listen no longer stops the language server, and the
+accept loop stops when the listen socket closes.
+---
+ README.md                                     |  8 ++-
+ .../lib/language_server/mcp/supervisor.ex     |  8 +--
+ .../lib/language_server/mcp/tcp_server.ex     | 67 ++++++++++++++-----
+ .../lib/language_server/server.ex             | 15 ++++-
+ .../test/mcp/tcp_server_test.exs              | 38 +++++++++++
+ scripts/tcp_to_stdio_bridge.exs               |  5 +-
+ 6 files changed, 114 insertions(+), 27 deletions(-)
+ create mode 100644 apps/language_server/test/mcp/tcp_server_test.exs
+
+diff --git a/README.md b/README.md
+index d68bc791..b390e5ec 100644
+--- a/README.md
++++ b/README.md
+@@ -399,10 +399,12 @@ The MCP server starts automatically when ElixirLS launches (if enabled). The ser
+ - **Default behavior**: Port is calculated as `3789 + hash(workspace_path)` to ensure different workspaces use different ports
+ - **Custom port**: Can be set via the `elixirLS.mcpPort` setting
+ - **Port discovery**: If the calculated/configured port is busy, the server automatically finds the next available port
++- **Host**: The server listens on the host in the `elixirLS.mcpHost` setting. The default is `localhost`, which keeps the server on loopback. Another value, such as `0.0.0.0`, puts the server on the network. The server has no authentication
++- **Address family**: The server resolves the host IPv4 first, so `localhost` binds `127.0.0.1`. A client that tries only `::1` cannot connect. Use `127.0.0.1` in that client
+ 
+ **Finding the actual port**: Check the ElixirLS output logs for a message like:
+ ```
+-[MCP] Server listening on port 4328
++[MCP] Server listening on localhost, port 4328
+ ```
+ 
+ #### TCP-to-STDIO Bridge
+@@ -433,7 +435,7 @@ To use ElixirLS with Claude Code or other MCP-compatible tools, create an `mcp.j
+ }
+ ```
+ 
+-Replace `/absolute/path/to/elixir-ls/` with the actual path to your ElixirLS installation and `4328` with the actual port number from the ElixirLS logs.
++Replace `/absolute/path/to/elixir-ls/` with the actual path to your ElixirLS installation and `4328` with the actual port number from the ElixirLS logs. The bridge connects to `localhost`. If you set `elixirLS.mcpHost`, add the same host after the port in `args`.
+ 
+ #### MCP Settings
+ 
+@@ -441,6 +443,7 @@ The MCP server can be configured via ElixirLS settings:
+ 
+ - **`elixirLS.mcpEnabled`** (boolean, default: `false`): Enable or disable the MCP server
+ - **`elixirLS.mcpPort`** (integer, optional): Set a specific port for the MCP server. If not set, uses `3789 + hash(workspace_path)` for predictable port assignment per workspace
++- **`elixirLS.mcpHost`** (string, default: `localhost`): The host that the MCP server listens on. The default keeps the server on loopback. Another value, such as `0.0.0.0`, puts the server on the network, and the server has no authentication. The server reads this setting when it starts
+ 
+ ## Automatic builds and error reporting
+ 
+@@ -516,6 +519,7 @@ Below is a list of configuration options supported by the ElixirLS language serv
+ <dt>elixirLS.dotFormatter</dt><dd>Path to a custom <code>.formatter.exs</code> file used when formatting documents</dd>
+ <dt>elixirLS.mcpEnabled</dt><dd>Enable or disable the MCP (Model Context Protocol) server - Defaults to <code>false</code></dd>
+ <dt>elixirLS.mcpPort</dt><dd>Set a specific TCP port for the MCP server - If not set, uses <code>3789 + hash(workspace_path)</code> for predictable port assignment per workspace</dd>
++<dt>elixirLS.mcpHost</dt><dd>Host that the MCP server listens on - Defaults to <code>localhost</code>, which keeps the server on loopback. The server has no authentication</dd>
+ </dl>
+ 
+ ## Debug Adapter configuration options
+diff --git a/apps/language_server/lib/language_server/mcp/supervisor.ex b/apps/language_server/lib/language_server/mcp/supervisor.ex
+index 954726b7..b7d78f1f 100644
+--- a/apps/language_server/lib/language_server/mcp/supervisor.ex
++++ b/apps/language_server/lib/language_server/mcp/supervisor.ex
+@@ -1,15 +1,15 @@
+ defmodule ElixirLS.LanguageServer.MCP.Supervisor do
+   use Supervisor
+ 
+-  def start_link(parent \\ self(), name \\ nil, port) do
+-    Supervisor.start_link(__MODULE__, {parent, port}, name: name || __MODULE__)
++  def start_link(parent \\ self(), name \\ nil, opts) do
++    Supervisor.start_link(__MODULE__, {parent, opts}, name: name || __MODULE__)
+   end
+ 
+   @impl Supervisor
+-  def init({_parent, port}) do
++  def init({_parent, opts}) do
+     Supervisor.init(
+       [
+-        {ElixirLS.LanguageServer.MCP.TCPServer, port: port}
++        {ElixirLS.LanguageServer.MCP.TCPServer, opts}
+       ],
+       strategy: :one_for_one
+     )
+diff --git a/apps/language_server/lib/language_server/mcp/tcp_server.ex b/apps/language_server/lib/language_server/mcp/tcp_server.ex
+index 791b091c..945272af 100644
+--- a/apps/language_server/lib/language_server/mcp/tcp_server.ex
++++ b/apps/language_server/lib/language_server/mcp/tcp_server.ex
+@@ -7,9 +7,13 @@ defmodule ElixirLS.LanguageServer.MCP.TCPServer do
+ 
+   alias ElixirLS.LanguageServer.MCP.RequestHandler
+ 
++  # The default keeps the server on loopback. The server has no authentication.
++  @default_host "localhost"
++
+   def start_link(opts) do
+     port = Keyword.get(opts, :port, 3798)
+-    GenServer.start_link(__MODULE__, port, name: __MODULE__)
++    host = Keyword.get(opts, :host) || @default_host
++    GenServer.start_link(__MODULE__, {host, port}, name: __MODULE__)
+   end
+ 
+   def child_spec(opts) do
+@@ -22,18 +26,35 @@ defmodule ElixirLS.LanguageServer.MCP.TCPServer do
+   end
+ 
+   @impl true
+-  def init(port) do
+-    IO.puts("[MCP] Starting TCP Server, trying port #{port}")
++  def init({host, port}) do
++    IO.puts("[MCP] Starting TCP Server on #{host}, trying port #{port}")
++
++    with {:ok, ip} <- resolve_host(host),
++         {:ok, actual_port, listen_socket} <- find_available_port(ip, port) do
++      IO.puts("[MCP] Server listening on #{host}, port #{actual_port}")
++      send(self(), :accept)
++      {:ok, %{listen: listen_socket, port: actual_port, clients: %{}}}
++    else
++      {:error, reason} ->
++        IO.puts(
++          "[MCP] Failed to listen on #{host} starting from port #{port}: #{inspect(reason)}"
++        )
+ 
+-    case find_available_port(port) do
+-      {:ok, actual_port, listen_socket} ->
+-        IO.puts("[MCP] Server listening on port #{actual_port}")
+-        send(self(), :accept)
+-        {:ok, %{listen: listen_socket, port: actual_port, clients: %{}}}
++        # A failure here must not stop the language server. A host can fail to
++        # resolve or to bind, and only :eaddrinuse is retried.
++        :ignore
++    end
++  end
+ 
+-      {:error, reason} ->
+-        IO.puts("[MCP] Failed to find available port starting from #{port}: #{inspect(reason)}")
+-        {:stop, reason}
++  @doc false
++  # IPv4 first, as :gen_tcp.connect/3 does with no family option. So a client
++  # that connects by the same name reaches the address that the server binds.
++  def resolve_host(host) do
++    name = String.to_charlist(host)
++
++    case :inet.getaddr(name, :inet) do
++      {:ok, ip} -> {:ok, ip}
++      {:error, _} -> :inet.getaddr(name, :inet6)
+     end
+   end
+ 
+@@ -127,27 +148,33 @@ defmodule ElixirLS.LanguageServer.MCP.TCPServer do
+ 
+   # Private functions
+ 
+-  defp find_available_port(start_port, max_attempts \\ 100) do
+-    find_available_port(start_port, start_port, max_attempts)
++  defp find_available_port(ip, start_port, max_attempts \\ 100) do
++    find_available_port(ip, start_port, start_port, max_attempts)
+   end
+ 
+-  defp find_available_port(current_port, start_port, attempts_left) when attempts_left > 0 do
+-    case :gen_tcp.listen(current_port, [:binary, packet: :line, active: false, reuseaddr: true]) do
++  defp find_available_port(ip, current_port, start_port, attempts_left)
++       when attempts_left > 0 do
++    case :gen_tcp.listen(current_port, listen_options(ip)) do
+       {:ok, listen_socket} ->
+         {:ok, current_port, listen_socket}
+ 
+       {:error, :eaddrinuse} ->
+-        find_available_port(current_port + 1, start_port, attempts_left - 1)
++        find_available_port(ip, current_port + 1, start_port, attempts_left - 1)
+ 
+       {:error, reason} ->
+         {:error, reason}
+     end
+   end
+ 
+-  defp find_available_port(_current_port, start_port, 0) do
++  defp find_available_port(_ip, _current_port, start_port, 0) do
+     {:error, "No available ports found starting from #{start_port}"}
+   end
+ 
++  defp listen_options(ip) do
++    family = if tuple_size(ip) == 8, do: [:inet6], else: []
++    family ++ [:binary, ip: ip, packet: :line, active: false, reuseaddr: true]
++  end
++
+   defp accept_connection(parent, listen_socket) do
+     IO.puts("[MCP] Waiting for connection...")
+ 
+@@ -161,6 +188,12 @@ defmodule ElixirLS.LanguageServer.MCP.TCPServer do
+         # Continue accepting
+         accept_connection(parent, listen_socket)
+ 
++      {:error, reason} when reason in [:closed, :einval] ->
++        # The server closed the listen socket. The loop is not linked to the
++        # GenServer, so without this clause it would retry forever.
++        IO.puts("[MCP] Listen socket closed, stopping accept loop")
++        :ok
++
+       {:error, reason} ->
+         IO.puts("[MCP] Accept error: #{inspect(reason)}")
+         Process.sleep(1000)
+diff --git a/apps/language_server/lib/language_server/server.ex b/apps/language_server/lib/language_server/server.ex
+index 18d8555f..6524e63b 100644
+--- a/apps/language_server/lib/language_server/server.ex
++++ b/apps/language_server/lib/language_server/server.ex
+@@ -2448,6 +2448,7 @@ defmodule ElixirLS.LanguageServer.Server do
+       Map.get(settings, "mcpEnabled", false) == true
+ 
+     mcp_port = calculate_mcp_port(settings, state.root_uri)
++    mcp_host = mcp_host(settings)
+ 
+     state =
+       state
+@@ -2457,7 +2458,7 @@ defmodule ElixirLS.LanguageServer.Server do
+       |> set_project_dir(project_dir)
+       |> Map.put(:settings, settings)
+       |> set_dialyzer_enabled(enable_dialyzer)
+-      |> set_mcp_enabled(enable_mcp, mcp_port)
++      |> set_mcp_enabled(enable_mcp, mcp_port, mcp_host)
+ 
+     add_watched_extensions(state.server_instance_id, additional_watched_extensions)
+ 
+@@ -2599,10 +2600,10 @@ defmodule ElixirLS.LanguageServer.Server do
+     end
+   end
+ 
+-  defp set_mcp_enabled(state = %__MODULE__{}, enable_mcp, port) do
++  defp set_mcp_enabled(state = %__MODULE__{}, enable_mcp, port, host) do
+     cond do
+       enable_mcp and state.mcp_sup == nil ->
+-        {:ok, pid} = ElixirLS.LanguageServer.MCP.Supervisor.start_link(port)
++        {:ok, pid} = ElixirLS.LanguageServer.MCP.Supervisor.start_link(port: port, host: host)
+         %{state | mcp_sup: pid}
+ 
+       not enable_mcp and state.mcp_sup != nil ->
+@@ -2621,6 +2622,14 @@ defmodule ElixirLS.LanguageServer.Server do
+     end
+   end
+ 
++  # nil leaves the default host to the MCP TCP server.
++  defp mcp_host(settings) do
++    case Map.get(settings, "mcpHost") do
++      host when is_binary(host) and host != "" -> host
++      _ -> nil
++    end
++  end
++
+   defp hash_root_uri(nil), do: 0
+ 
+   defp hash_root_uri(root_uri) when is_binary(root_uri) do
+diff --git a/apps/language_server/test/mcp/tcp_server_test.exs b/apps/language_server/test/mcp/tcp_server_test.exs
+new file mode 100644
+index 00000000..6bf9de80
+--- /dev/null
++++ b/apps/language_server/test/mcp/tcp_server_test.exs
+@@ -0,0 +1,38 @@
++defmodule ElixirLS.LanguageServer.MCP.TCPServerTest do
++  use ExUnit.Case, async: false
++
++  alias ElixirLS.LanguageServer.MCP.TCPServer
++
++  @loopback [{127, 0, 0, 1}, {0, 0, 0, 0, 0, 0, 0, 1}]
++
++  # port: 0 lets the OS choose a free port, so the tests need no fixed port.
++  defp bound_address(opts) do
++    pid = start_supervised!({TCPServer, [port: 0] ++ opts})
++    {:ok, {ip, _port}} = :inet.sockname(:sys.get_state(pid).listen)
++    ip
++  end
++
++  test "the default host binds the socket to loopback" do
++    assert bound_address([]) in @loopback
++  end
++
++  test "the socket binds the host that the supervisor passes" do
++    start_supervised!({ElixirLS.LanguageServer.MCP.Supervisor, [port: 0, host: "127.0.0.1"]})
++    listen = :sys.get_state(TCPServer).listen
++    assert {:ok, {{127, 0, 0, 1}, _port}} = :inet.sockname(listen)
++  end
++
++  # 192.0.2.1 is a documentation address, so no machine has it.
++  test "a host that cannot be bound does not start the server" do
++    assert {:ok, :undefined} = start_supervised({TCPServer, port: 0, host: "192.0.2.1"})
++  end
++
++  test "the configured host resolves to the address to bind" do
++    assert {:ok, ip} = TCPServer.resolve_host("localhost")
++    assert ip in @loopback
++    assert TCPServer.resolve_host("127.0.0.1") == {:ok, {127, 0, 0, 1}}
++    assert TCPServer.resolve_host("0.0.0.0") == {:ok, {0, 0, 0, 0}}
++    assert TCPServer.resolve_host("::1") == {:ok, {0, 0, 0, 0, 0, 0, 0, 1}}
++    assert TCPServer.resolve_host("::") == {:ok, {0, 0, 0, 0, 0, 0, 0, 0}}
++  end
++end
+diff --git a/scripts/tcp_to_stdio_bridge.exs b/scripts/tcp_to_stdio_bridge.exs
+index e2fb6e04..51312b09 100644
+--- a/scripts/tcp_to_stdio_bridge.exs
++++ b/scripts/tcp_to_stdio_bridge.exs
+@@ -85,4 +85,7 @@ port =
+     [] -> 3798
+   end
+ 
+-TcpToStdioBridge.start("localhost", port)
++# The optional second argument is the host, the same name as in mcpHost.
++host = Enum.at(System.argv(), 1, "localhost")
++
++TcpToStdioBridge.start(host, port)
+-- 
+2.53.0
+
