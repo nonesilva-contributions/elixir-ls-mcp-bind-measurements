@@ -167,7 +167,4 @@ OTP 27:
   answered it. This was measured on a Linux host with OTP 27 and Elixir 1.20.0,
   not in Docker.
 
-Related: <https://github.com/nonesilva-contributions/otp-loopback-node-measurements>
-measures Erlang distribution in the same way.
-
 License: MIT.
